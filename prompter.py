@@ -8,8 +8,10 @@ GNOME Shell, тому це робить розширення з extension/ (ди
 """
 import ctypes
 import json
+import math
 import re
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 import gi
@@ -42,11 +44,12 @@ ACTIONS = [
     ("lock", "<Control><Super>l", "Закріпити / відкріпити (кліки крізь суфлер)"),
     ("bigger", "<Control><Super>equal", "Більший шрифт"),
     ("smaller", "<Control><Super>minus", "Менший шрифт"),
+    ("open-link", "<Control><Super>o", "Відкрити посилання сторінки"),
 ]
 DEFAULT_SHORTCUTS = {name: accel for name, accel, _ in ACTIONS}
 # All app actions — reachable from the window, `prompter ДІЯ` and D-Bus.
 REMOTE_ACTIONS = [name for name, *_ in ACTIONS] + ["show", "hide", "new-page", "reload", "open",
-                                                  "save-as", "preferences", "shortcuts", "about", "quit"]
+                                                  "save", "save-as", "insert-link", "preferences", "shortcuts", "about", "quit"]
 
 # Клавіші, коли у фокусі саме вікно суфлера.
 OVERLAY_KEYS = [
@@ -67,6 +70,8 @@ DEFAULT_SETTINGS = {
     "align": "left",
     "overlay_visible": True,
     "locked": False,
+    "editor_view": "raw",
+    "table_column": 0,  # which column of a Markdown table the pages show (e.g. a language)  # "raw" — markdown as is, "formatted" — pages as the overlay shows them
     "shortcuts": {},  # {action: accelerator}; empty = not migrated from shortcuts.json yet
 }
 
@@ -80,6 +85,7 @@ SAMPLE_SCRIPT = """\
 У тексті сторінки розділяє рядок із трьох дефісів.
 **Жирний текст** — як у Markdown.
 // Рядок із // — примітка для себе (дрібна і сіра).
+[Кнопка-посилання](https://example.com) — кнопка «Посилання» внизу (Ctrl+K).
 
 ---
 
@@ -117,61 +123,157 @@ def save_json(path, data):
 
 SEPARATOR = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
 PAGE_BREAK = "\n\n---\n\n"
+# Markdown tables: every data row is its own page; one column (language) is shown.
+TABLE_ROW = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
+TABLE_RULE = re.compile(r"^[ \t]*\|?[ \t]*:?-{3,}:?[ \t]*(\|[ \t]*:?-{3,}:?[ \t]*)*\|?[ \t]*$")
+BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
+
+# start/end: the page's source in the text (a table row is one line);
+# text: what the page shows; after: where "+ Нова сторінка" inserts a page
+# break (for table rows: after the whole table, so the table stays intact).
+Page = namedtuple("Page", "start end text after")
 
 
-def block_spans(text):
-    """(start, end) offsets of the non-empty pages (blocks) between `---` lines."""
-    spans, start = [], 0
+def table_cells(line):
+    inner = line.strip()
+    inner = inner[1:] if inner.startswith("|") else inner
+    inner = inner[:-1] if inner.endswith("|") and not inner.endswith("\\|") else inner
+    return [cell.strip().replace("\\|", "|") for cell in re.split(r"(?<!\\)\|", inner)]
+
+
+def table_columns(text):
+    """Header cells of the first table in the script, or []."""
+    lines = text.splitlines()
+    for line, rule in zip(lines, lines[1:]):
+        if TABLE_ROW.match(line) and TABLE_RULE.match(rule):
+            return table_cells(line)
+    return []
+
+
+def parse_pages(text, column=0):
+    """Pages of the script: blocks between `---` lines, except that a table
+    row becomes a page of its own showing cell `column` (<br> → new line)."""
+    pages = []
+
+    def add_text(start, end):
+        if text[start:end].strip():
+            pages.append(Page(start, end, text[start:end].strip("\n"),
+                              start + len(text[start:end].rstrip())))
+
+    chunks, start = [], 0
     for m in SEPARATOR.finditer(text):
-        spans.append((start, m.start()))
+        chunks.append((start, m.start()))
         start = m.end()
-    spans.append((start, len(text)))
-    return [(s, e) for s, e in spans if text[s:e].strip()]
+    chunks.append((start, len(text)))
+    for chunk_start, chunk_end in chunks:
+        lines = text[chunk_start:chunk_end].splitlines(keepends=True)
+        pos = run_start = chunk_start
+        i = 0
+        while i < len(lines):
+            if TABLE_ROW.match(lines[i]) and i + 1 < len(lines) and TABLE_RULE.match(lines[i + 1]):
+                add_text(run_start, pos)
+                pos += len(lines[i]) + len(lines[i + 1])
+                i += 2
+                rows = []
+                while i < len(lines) and TABLE_ROW.match(lines[i]):
+                    cells = table_cells(lines[i])
+                    cell = BR.sub("\n", cells[min(column, len(cells) - 1)])
+                    rows.append((pos, pos + len(lines[i].rstrip("\r\n")), cell))
+                    pos += len(lines[i])
+                    i += 1
+                table_end = rows[-1][1] if rows else pos
+                pages.extend(Page(s, e, t, table_end) for s, e, t in rows if t.strip())
+                run_start = pos
+                continue
+            pos += len(lines[i])
+            i += 1
+        add_text(run_start, pos)
+    return pages
 
 
-def split_blocks(text):
-    return [text[s:e].strip("\n") for s, e in block_spans(text)]
+def block_spans(text, column=0):
+    """(start, end) offsets of the pages in the text."""
+    return [(p.start, p.end) for p in parse_pages(text, column)]
 
 
-def block_at(text, offset):
+def split_blocks(text, column=0):
+    return [p.text for p in parse_pages(text, column)]
+
+
+def block_at(text, offset, column=0):
     """Index of the page the cursor at `offset` belongs to; on a separator or
     in an empty page, the next page (or the last one)."""
-    spans = block_spans(text)
+    spans = block_spans(text, column)
     for i, (_start, end) in enumerate(spans):
         if offset <= end:
             return i
     return max(len(spans) - 1, 0)
 
 
-def page_break_offset(text, offset):
-    """Where "+ Нова сторінка" inserts PAGE_BREAK: right after the text of the
-    page the cursor is in, so the new page comes next."""
-    spans = block_spans(text)
-    if not spans:
+def page_break_offset(text, offset, column=0):
+    """Where "+ Нова сторінка" inserts PAGE_BREAK: right after the page the
+    cursor is in (after the whole table for a table row)."""
+    pages = parse_pages(text, column)
+    if not pages:
         return len(text.rstrip())
-    start, end = spans[block_at(text, offset)]
-    return start + len(text[start:end].rstrip())
+    return pages[block_at(text, offset, column)].after
+
+
+LINK = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")  # [Напис](https://адреса)
+DIRECTION = re.compile(r"\[([^\]\n]+)\](?!\()")  # [що показати на екрані]
+NOTE_PREFIXES = ("//", ">")
+
+
+def normalize_url(url):
+    """Adds https:// when the address has no scheme ("example.com")."""
+    url = url.strip()
+    return url if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", url) else "https://" + url
+
+
+def links_of(block):
+    """[(title, url)] of the page's Markdown links — shown as buttons."""
+    return [(m.group(1).strip(), normalize_url(m.group(2))) for m in LINK.finditer(block)]
+
+
+# Private-use characters mark spans before escaping; replaced by tags after.
+_MARKS = {"": "<u>", "": "</u>",
+          "": '<span alpha="60%"><i><small>[', "": "]</small></i></span>"}
 
 
 def to_markup(block):
+    """Pango markup for a page: # headings, **bold**, *italic*, `code`, lists,
+    [stage directions] and // or > notes dimmed, link titles underlined."""
     lines = []
-    for line in block.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("//"):
-            note = GLib.markup_escape_text(stripped[2:].strip())
-            lines.append(f'<span alpha="70%"><small><small>{note}</small></small></span>')
+    for line in BR.sub("\n", block).splitlines():
+        stripped = line.strip()
+        if LINK.fullmatch(stripped):
+            continue  # a line that is only a link is shown just as its button
+        if stripped.startswith(NOTE_PREFIXES):
+            note = LINK.sub(r"\1", stripped.lstrip("/>").strip())
+            lines.append(f'<span alpha="70%"><small><small>{GLib.markup_escape_text(note)}</small></small></span>')
             continue
         if stripped.startswith("#"):
             line = "**" + stripped.lstrip("#").strip() + "**"
+        line = re.sub(r"^(\s*)[-*+][ \t]+", r"\1• ", line)
+        line = LINK.sub(lambda m: "" + m.group(1) + "", line)
+        line = DIRECTION.sub(lambda m: "" + m.group(1) + "", line)
         escaped = GLib.markup_escape_text(line)
-        lines.append(re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped))
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"(?<![*\w])\*(?![\s*])(.+?)(?<![\s*])\*(?![*\w])", r"<i>\1</i>", escaped)
+        escaped = re.sub(r"`([^`]+)`", r"<tt>\1</tt>", escaped)
+        for mark, tag in _MARKS.items():
+            escaped = escaped.replace(mark, tag)
+        lines.append(escaped)
     return "\n".join(lines)
 
 
 def first_line(block):
-    for line in block.splitlines():
-        line = line.strip().lstrip("#").strip().replace("**", "")
-        if line and not line.startswith("//"):
+    for line in BR.sub("\n", block).splitlines():
+        if line.strip().startswith(NOTE_PREFIXES) or LINK.fullmatch(line.strip()):
+            continue
+        line = LINK.sub(r"\1", line).strip().lstrip("#").strip().replace("**", "")
+        line = re.sub(r"^[-*+][ \t]+", "• ", line)
+        if line:
             return line
     return ""
 
@@ -219,24 +321,41 @@ def validate_shortcut(accel, shortcuts, action):
 
 # --- windows -----------------------------------------------------------------
 
-def set_input_region(surface, empty):
-    """gdk_surface_set_input_region(): an empty region lets clicks through,
-    NULL restores the default. Called via ctypes because PyGObject needs the
-    extra python3-gi-cairo package for cairo regions."""
+class _CairoRect(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int), ("width", ctypes.c_int), ("height", ctypes.c_int)]
+
+
+def set_input_region(surface, rects):
+    """gdk_surface_set_input_region(): only `rects` [(x, y, w, h)] take clicks
+    (an empty list lets every click through), None restores the default.
+    Called via ctypes because PyGObject needs the extra python3-gi-cairo
+    package for cairo regions."""
     get_pointer = ctypes.pythonapi.PyCapsule_GetPointer
     get_pointer.restype = ctypes.c_void_p
     get_pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
     gtk = ctypes.CDLL("libgtk-4.so.1")
     gtk.gdk_surface_set_input_region.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     region = None
-    if empty:
+    if rects is not None:
         cairo = ctypes.CDLL("libcairo.so.2")
         cairo.cairo_region_create.restype = ctypes.c_void_p
         cairo.cairo_region_destroy.argtypes = [ctypes.c_void_p]
+        cairo.cairo_region_union_rectangle.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CairoRect)]
         region = cairo.cairo_region_create()
+        for rect in rects:
+            cairo.cairo_region_union_rectangle(region, ctypes.byref(_CairoRect(*rect)))
     gtk.gdk_surface_set_input_region(get_pointer(surface.__gpointer__, None), region)
     if region:
         cairo.cairo_region_destroy(region)  # GDK keeps its own copy
+
+
+def refresh_shell_input():
+    """Asks the extension to make GNOME Shell re-pick what is under the pointer
+    after the overlay's input region changed (see CLAUDE.md)."""
+    Gio.bus_get_sync(Gio.BusType.SESSION, None).call(
+        SHELL_BUS, SHELL_PATH, SHELL_BUS, "RefreshInput", None, None,
+        Gio.DBusCallFlags.NO_AUTO_START, 1000, None, None)
+    return GLib.SOURCE_REMOVE
 
 
 RESIZE_MARGIN = 16  # px from the overlay's edge where dragging resizes instead of moving
@@ -253,15 +372,17 @@ def resize_edge(x, y, width, height, margin=RESIZE_MARGIN):
 
 
 class OverlayWindow(Gtk.Window):
-    """Напівпрозоре вікно з поточною сторінкою. Перетягується за будь-яке місце,
-    розмір змінюється за краї й кути (вікно без рамки, тож це робимо самі).
-    У закріпленому стані порожній input region пропускає кліки до вікон під ним."""
+    """Напівпрозоре вікно з поточною сторінкою і кнопками її посилань.
+    Перетягується за будь-яке місце, розмір змінюється за краї й кути (вікно
+    без рамки, тож це робимо самі). У закріпленому стані input region містить
+    лише кнопки-посилання: решта кліків іде до вікон під суфлером."""
 
     def __init__(self, app):
         super().__init__(application=app, title=OVERLAY_TITLE, decorated=False,
                          default_width=900, default_height=320)
         self.add_css_class("prompter-overlay")
         self.locked = False
+        self.link_buttons = []
 
         self.status = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         self.status.add_css_class("status")
@@ -276,6 +397,8 @@ class OverlayWindow(Gtk.Window):
         self.text.add_css_class("text")
         self.scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         self.scroller.set_child(self.text)
+        self.links = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=8, row_spacing=8,
+                                 max_children_per_line=8, visible=False)
 
         self.preview = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         self.preview.add_css_class("preview")
@@ -289,6 +412,7 @@ class OverlayWindow(Gtk.Window):
         card.add_css_class("card")
         card.append(top)
         card.append(self.scroller)
+        card.append(self.links)
         card.append(bottom)
         self.set_child(Gtk.WindowHandle(child=card))
 
@@ -339,15 +463,53 @@ class OverlayWindow(Gtk.Window):
 
     def apply_input_region(self):
         surface = self.get_surface()
-        if surface:
-            set_input_region(surface, self.locked)
+        if not surface:
+            return
+        rects = None
+        if self.locked:
+            rects = []
+            for button in self.link_buttons:
+                ok, r = button.compute_bounds(self)
+                if ok and button.get_mapped():
+                    rects.append((int(r.get_x()), int(r.get_y()),
+                                  math.ceil(r.get_width()), math.ceil(r.get_height())))
+        set_input_region(surface, rects)
 
-    def show_block(self, markup, status, preview, reset_scroll):
+    def queue_input_region(self):
+        """Re-applies the locked input region once the new buttons are laid out
+        (two frames later), then lets GNOME Shell re-pick under the pointer."""
+        if not self.locked:
+            return
+        frames = [0]
+
+        def tick(_widget, _clock):
+            frames[0] += 1
+            if frames[0] < 2:
+                return GLib.SOURCE_CONTINUE
+            self.apply_input_region()
+            GLib.timeout_add(200, refresh_shell_input)
+            return GLib.SOURCE_REMOVE
+
+        self.add_tick_callback(tick)
+
+    def show_block(self, markup, status, preview, reset_scroll, links=()):
         self.text.set_markup(markup)
         self.status.set_text(status)
         self.preview.set_text(preview)
         if reset_scroll:
             self.scroller.get_vadjustment().set_value(0)
+        if [b.get_tooltip_text() for b in self.link_buttons] != [url for _t, url in links] or \
+                [b.get_label() for b in self.link_buttons] != [f"↗  {t}" for t, _u in links]:
+            self.links.remove_all()
+            self.link_buttons = []
+            for title, url in links:
+                button = Gtk.Button(label=f"↗  {title}", tooltip_text=url, focus_on_click=False)
+                button.add_css_class("link-button")
+                button.connect("clicked", lambda _b, url=url: self.get_application().open_url(url))
+                self.links.append(button)
+                self.link_buttons.append(button)
+            self.links.set_visible(bool(links))
+            self.queue_input_region()
 
     def scroll(self, direction, step):
         adj = self.scroller.get_vadjustment()
@@ -367,8 +529,15 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar(title_widget=self.title)
         header.pack_start(Gtk.Button(icon_name="document-open-symbolic", action_name="app.open",
                                      tooltip_text="Відкрити сценарій (Ctrl+O)"))
+        self.view_toggle = Adw.ToggleGroup()
+        self.view_toggle.add(Adw.Toggle(name="raw", label="Сирий",
+                                        tooltip="Markdown як є — тут редагується текст"))
+        self.view_toggle.add(Adw.Toggle(name="formatted", label="Форматований",
+                                        tooltip="Сторінки так, як їх покаже суфлер; клік — показати сторінку"))
+        header.pack_start(self.view_toggle)
         menu = Gio.Menu()
         menu.append("Відкрити…", "app.open")
+        menu.append("Зберегти", "app.save")
         menu.append("Зберегти як…", "app.save-as")
         section = Gio.Menu()
         section.append("Гарячі клавіші", "app.shortcuts")
@@ -399,12 +568,21 @@ class MainWindow(Adw.ApplicationWindow):
             "separator", foreground="#8f8f8f", weight=Pango.Weight.BOLD,
             justification=Gtk.Justification.CENTER, pixels_above_lines=6, pixels_below_lines=6)
         self.current_tag = self.buffer.create_tag("current", paragraph_background="rgba(53,132,228,0.10)")
+        self.link_tag = self.buffer.create_tag("link", foreground="#3584e4", underline=Pango.Underline.SINGLE)
         # Capture phase: otherwise the text view takes Ctrl+Enter as a newline.
         keys = Gtk.ShortcutController(propagation_phase=Gtk.PropagationPhase.CAPTURE)
         keys.add_shortcut(Gtk.Shortcut(trigger=Gtk.ShortcutTrigger.parse_string("<Control>Return|<Control>KP_Enter"),
                                        action=Gtk.NamedAction.new("app.new-page")))
         self.view.add_controller(keys)
         editor = Gtk.ScrolledWindow(vexpand=True, child=self.view)
+        self.pages_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=16,
+                                 margin_bottom=16, margin_start=16, margin_end=16)
+        self.pages_scroller = Gtk.ScrolledWindow(vexpand=True, child=Adw.Clamp(child=self.pages_box,
+                                                                                maximum_size=900))
+        self.stack = Adw.ViewStack(vexpand=True)
+        self.stack.add_named(editor, "raw")
+        self.stack.add_named(self.pages_scroller, "formatted")
+        self.page_cards = []
 
         bar = Gtk.ActionBar()
         bar.pack_start(Gtk.Button(icon_name="go-previous-symbolic", action_name="app.prev",
@@ -418,6 +596,14 @@ class MainWindow(Adw.ApplicationWindow):
                               tooltip_text="Додати сторінку після поточної (Ctrl+Enter)")
         new_page.add_css_class("flat")
         bar.pack_start(new_page)
+        link = Gtk.Button(child=Adw.ButtonContent(icon_name="insert-link-symbolic", label="Посилання"),
+                          action_name="app.insert-link",
+                          tooltip_text="Вставити кнопку, що відкриває адресу в браузері (Ctrl+K)")
+        link.add_css_class("flat")
+        bar.pack_start(link)
+        self.column = Gtk.DropDown(visible=False, valign=Gtk.Align.CENTER,
+                                   tooltip_text="Яку колонку таблиці показувати (наприклад, мову)")
+        bar.pack_start(self.column)
         self.hint = Gtk.Button(action_name="app.shortcuts", tooltip_text="Змінити гарячі клавіші")
         self.hint.add_css_class("flat")
         self.hint.add_css_class("dim-label")
@@ -425,7 +611,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.append(self.banner)
-        box.append(editor)
+        box.append(self.stack)
         box.append(bar)
         toolbar = Adw.ToolbarView(content=box)
         toolbar.add_top_bar(header)
@@ -459,6 +645,7 @@ class Prompter(Adw.Application):
         self.save_id = 0
         self.reload_id = 0
         self.programmatic_cursor = False
+        self.updating_columns = False
         self.css = Gtk.CssProvider()
 
     def do_startup(self):
@@ -480,12 +667,19 @@ class Prompter(Adw.Application):
         self.locked_action.connect("change-state", lambda _a, v: self.set_locked(v.unpack()))
         self.add_action(self.locked_action)
 
-        for action, accels in {"open": ["<Control>o"], "save-as": ["<Control><Shift>s"],
+        for action, accels in {"open": ["<Control>o"], "save": ["<Control>s", "<Super>s"],
+                               "save-as": ["<Control><Shift>s", "<Super><Shift>s"],
                                "preferences": ["<Control>comma"], "quit": ["<Control>q"],
                                "next": ["<Control>Page_Down"], "prev": ["<Control>Page_Up"],
-                               "new-page": ["<Control>Return"]}.items():
+                               "new-page": ["<Control>Return"], "insert-link": ["<Control>k"]}.items():
             self.set_accels_for_action(f"app.{action}", accels)
 
+        if self.settings["shortcuts"] != self.shortcuts:
+            # Migrate from shortcuts.json and add actions new in this version, so
+            # settings.json always holds the full set (shortcuts.json is emptied
+            # while a combination is being recorded).
+            self.settings["shortcuts"] = self.shortcuts
+            self.save_settings()
         self.publish_shortcuts()
         Gio.bus_watch_name(Gio.BusType.SESSION, SHELL_BUS, Gio.BusNameWatcherFlags.NONE,
                            lambda *_: self.win and self.win.banner.set_revealed(False),
@@ -510,6 +704,10 @@ class Prompter(Adw.Application):
         self.win.buffer.connect("changed", self.on_buffer_changed)
         self.win.buffer.connect("notify::cursor-position", self.on_cursor_moved)
         self.win.connect("close-request", self.on_main_close)
+        self.win.view_toggle.set_active_name(self.settings["editor_view"])
+        self.win.stack.set_visible_child_name(self.settings["editor_view"])
+        self.win.view_toggle.connect("notify::active-name", lambda t, _p: self.set_editor_view(t.get_active_name()))
+        self.win.column.connect("notify::selected", self.on_column_changed)
         self.overlay = OverlayWindow(self)
         self.overlay.set_align(self.settings["align"])
         self.overlay.set_locked(self.settings["locked"])
@@ -563,7 +761,7 @@ class Prompter(Adw.Application):
         self.settings["file"] = path
         self.save_settings()
         self.set_buffer_text(text)
-        self.win.title.set_subtitle(Path(path).name)
+        self.win.title.set_subtitle("Не збережено у файл — Ctrl+S" if self.is_untitled else Path(path).name)
         self.watch(path)
         self.update_blocks(reset_scroll=True)
         self.show_page_in_editor(place_cursor=True)
@@ -577,23 +775,24 @@ class Prompter(Adw.Application):
         buffer.handler_unblock_by_func(self.on_buffer_changed)
         buffer.place_cursor(buffer.get_iter_at_offset(min(cursor, buffer.get_char_count())))
         self.programmatic_cursor = False
-        self.tag_separators()
+        self.tag_markup()
 
-    def tag_separators(self):
+    def tag_markup(self):
+        """Grey centred page separators and blue links in the editor."""
         buffer = self.win.buffer
-        buffer.remove_tag(self.win.separator_tag, buffer.get_start_iter(), buffer.get_end_iter())
-        for m in SEPARATOR.finditer(self.text):
-            buffer.apply_tag(self.win.separator_tag, buffer.get_iter_at_offset(m.start()),
-                             buffer.get_iter_at_offset(m.end()))
+        for tag, pattern in ((self.win.separator_tag, SEPARATOR), (self.win.link_tag, LINK)):
+            buffer.remove_tag(tag, buffer.get_start_iter(), buffer.get_end_iter())
+            for m in pattern.finditer(self.text):
+                buffer.apply_tag(tag, buffer.get_iter_at_offset(m.start()), buffer.get_iter_at_offset(m.end()))
 
     def on_cursor_moved(self, buffer, _pspec):
         # The overlay follows the page the user is editing.
         if not self.programmatic_cursor:
-            self.go_to(block_at(self.text, buffer.props.cursor_position), from_editor=True)
+            self.go_to(block_at(self.text, buffer.props.cursor_position, self.column), from_editor=True)
 
     def show_page_in_editor(self, place_cursor=False):
         """Scrolls the editor to the current page (and puts the cursor there)."""
-        spans = block_spans(self.text)
+        spans = block_spans(self.text, self.column)
         if not spans:
             return
         buffer = self.win.buffer
@@ -606,7 +805,7 @@ class Prompter(Adw.Application):
 
     def on_buffer_changed(self, buffer):
         self.text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
-        self.tag_separators()
+        self.tag_markup()
         self.update_blocks()
         if self.save_id:
             GLib.source_remove(self.save_id)
@@ -653,9 +852,99 @@ class Prompter(Adw.Application):
     # --- display ------------------------------------------------------------
 
     def update_blocks(self, reset_scroll=False):
-        self.blocks = split_blocks(self.text) or [""]
+        self.update_columns()
+        self.blocks = split_blocks(self.text, self.column) or [""]
         self.index = max(0, min(self.index, len(self.blocks) - 1))
+        self.build_page_cards()
         self.render(reset_scroll)
+
+    @property
+    def column(self):
+        return self.settings["table_column"]
+
+    def update_columns(self):
+        """Shows the column picker when the script has a table."""
+        dropdown = self.win.column
+        names = [f"Колонка: {name or i + 1}" for i, name in enumerate(table_columns(self.text))]
+        model = dropdown.get_model()
+        current = [model.get_string(i) for i in range(model.get_n_items())] if model else []
+        self.updating_columns = True  # replacing the model resets the selection
+        if names != current:
+            dropdown.set_model(Gtk.StringList.new(names))
+        dropdown.set_visible(bool(names))
+        if names:
+            dropdown.set_selected(min(self.column, len(names) - 1))
+        self.updating_columns = False
+
+    def on_column_changed(self, dropdown, _pspec):
+        column = dropdown.get_selected()
+        if not self.updating_columns and dropdown.get_visible() and column != Gtk.INVALID_LIST_POSITION and column != self.column:
+            self.settings["table_column"] = column
+            self.save_settings()
+            self.update_blocks(reset_scroll=True)
+
+    def set_editor_view(self, view):
+        if view not in ("raw", "formatted"):
+            return
+        self.settings["editor_view"] = view
+        self.save_settings()
+        if self.win.view_toggle.get_active_name() != view:
+            self.win.view_toggle.set_active_name(view)
+        self.win.stack.set_visible_child_name(view)
+        self.build_page_cards()
+        self.mark_current_card()
+
+    def build_page_cards(self):
+        """The formatted view: one card per page, as the overlay renders it."""
+        win = self.win
+        if win.stack.get_visible_child_name() != "formatted":
+            return
+        while child := win.pages_box.get_first_child():
+            win.pages_box.remove(child)
+        win.page_cards = []
+        for i, block in enumerate(self.blocks):
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            card.add_css_class("card")
+            card.add_css_class("page-card")
+            number = Gtk.Label(label=f"Сторінка {i + 1}", xalign=0)
+            number.add_css_class("dim-label")
+            number.add_css_class("caption-heading")
+            card.append(number)
+            text = Gtk.Label(wrap=True, wrap_mode=Pango.WrapMode.WORD_CHAR, xalign=0)
+            text.set_markup(to_markup(block) or "<i>порожня сторінка</i>")
+            text.add_css_class("page-text")
+            card.append(text)
+            links = links_of(block)
+            if links:
+                row = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=8, row_spacing=8,
+                                  max_children_per_line=6)
+                for title, url in links:
+                    button = Gtk.Button(label=f"↗  {title}", tooltip_text=url, halign=Gtk.Align.START)
+                    button.add_css_class("pill")
+                    button.connect("clicked", lambda _b, url=url: self.open_url(url))
+                    row.append(button)
+                card.append(row)
+            click = Gtk.GestureClick()
+            click.connect("released", lambda *_a, i=i: self.go_to(i))
+            card.add_controller(click)
+            win.pages_box.append(card)
+            win.page_cards.append(card)
+
+    def mark_current_card(self):
+        cards = self.win.page_cards
+        for i, card in enumerate(cards):
+            (card.add_css_class if i == self.index else card.remove_css_class)("current")
+        if self.win.stack.get_visible_child_name() == "formatted" and self.index < len(cards):
+            GLib.idle_add(self.scroll_to_card, cards[self.index])
+
+    def scroll_to_card(self, card):
+        ok, bounds = card.compute_bounds(self.win.pages_box)
+        if ok:
+            adj = self.win.pages_scroller.get_vadjustment()
+            top, bottom = bounds.get_y(), bounds.get_y() + bounds.get_height()
+            if top < adj.get_value() or bottom > adj.get_value() + adj.get_page_size():
+                adj.set_value(max(0, top - 16))
+        return GLib.SOURCE_REMOVE
 
     def render(self, reset_scroll=False):
         n = len(self.blocks)
@@ -663,13 +952,14 @@ class Prompter(Adw.Application):
             preview = "→  " + first_line(self.blocks[self.index + 1])
         else:
             preview = "—  кінець  —"
-        self.overlay.show_block(to_markup(self.blocks[self.index]),
-                                f"{self.index + 1} / {n}   ·   {Path(self.path).name}",
-                                preview, reset_scroll)
+        block = self.blocks[self.index]
+        self.overlay.show_block(to_markup(block), f"{self.index + 1} / {n}   ·   {Path(self.path).name}",
+                                preview, reset_scroll, links_of(block))
         self.win.position.set_text(f"Сторінка {self.index + 1} / {n}")
+        self.mark_current_card()
         buffer = self.win.buffer
         buffer.remove_tag(self.win.current_tag, buffer.get_start_iter(), buffer.get_end_iter())
-        spans = block_spans(self.text)
+        spans = block_spans(self.text, self.column)
         if spans:
             start, end = spans[self.index]
             buffer.apply_tag(self.win.current_tag, buffer.get_iter_at_offset(start),
@@ -692,10 +982,17 @@ class Prompter(Adw.Application):
                                        border-radius: 18px; padding: 16px 26px 12px; }}
             .prompter-overlay .text {{ color: #ffffff; font-size: {s["font_size"]}px; font-weight: 600;
                                        line-height: 1.3; text-shadow: 0 1px 4px rgba(0, 0, 0, 0.9); }}
+            .prompter-overlay .link-button {{ background: rgba(255, 255, 255, 0.18); color: #ffffff;
+                                              border-radius: 999px; padding: 6px 16px; font-size: 16px;
+                                              font-weight: 600; box-shadow: none; }}
+            .prompter-overlay .link-button:hover {{ background: rgba(255, 255, 255, 0.30); }}
             .prompter-overlay .status, .prompter-overlay .preview, .prompter-overlay .grip {{
                 color: rgba(255, 255, 255, 0.6); font-size: 14px;
                 text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9); }}
             .editor {{ font-size: 16px; }}
+            .page-card {{ padding: 14px 18px; }}
+            .page-card.current {{ outline: 2px solid var(--accent-color); outline-offset: -2px; }}
+            .page-text {{ font-size: 18px; }}
         """)
 
     def update_hint(self):
@@ -719,14 +1016,7 @@ class Prompter(Adw.Application):
         self.overlay.set_locked(locked)
         # Once GTK has committed the new input region, let the extension make
         # GNOME Shell re-pick what is under the pointer.
-        GLib.timeout_add(200, self.refresh_shell_input)
-
-    @staticmethod
-    def refresh_shell_input():
-        Gio.bus_get_sync(Gio.BusType.SESSION, None).call(
-            SHELL_BUS, SHELL_PATH, SHELL_BUS, "RefreshInput", None, None,
-            Gio.DBusCallFlags.NO_AUTO_START, 1000, None, None)
-        return GLib.SOURCE_REMOVE
+        GLib.timeout_add(200, refresh_shell_input)
 
     def set_style(self, key, value):
         self.settings[key] = value
@@ -785,12 +1075,73 @@ class Prompter(Adw.Application):
     def on_smaller(self):
         self.set_style("font_size", max(16, self.settings["font_size"] - 4))
 
+    def edit_current_page(self):
+        """From the formatted view: back to the raw text, cursor at the end of
+        the current page, so new pages and links land after it."""
+        if self.settings["editor_view"] == "raw":
+            return
+        self.set_editor_view("raw")
+        spans = block_spans(self.text, self.column)
+        offset = page_break_offset(self.text, spans[self.index][0], self.column) if spans else len(self.text)
+        self.programmatic_cursor = True
+        self.win.buffer.place_cursor(self.win.buffer.get_iter_at_offset(offset))
+        self.programmatic_cursor = False
+
     def on_new_page(self):
+        self.edit_current_page()
         buffer = self.win.buffer
-        offset = page_break_offset(self.text, buffer.props.cursor_position)
+        offset = page_break_offset(self.text, buffer.props.cursor_position, self.column)
         buffer.insert(buffer.get_iter_at_offset(offset), PAGE_BREAK)
         buffer.place_cursor(buffer.get_iter_at_offset(offset + len(PAGE_BREAK)))
         self.win.view.scroll_to_mark(buffer.get_insert(), 0.1, False, 0, 0)
+        self.win.view.grab_focus()
+
+    def open_url(self, url):
+        try:
+            Gio.AppInfo.launch_default_for_uri(url, Gdk.Display.get_default().get_app_launch_context())
+        except GLib.Error as e:
+            self.win.toast(f"Не вдалося відкрити {url}: {e.message}")
+
+    def on_open_link(self):
+        links = links_of(self.blocks[self.index])
+        if links:
+            self.open_url(links[0][1])
+
+    def on_insert_link(self):
+        self.win.present()
+        self.edit_current_page()
+        dialog = Adw.AlertDialog(heading="Кнопка-посилання",
+                                 body="На цій сторінці суфлера з'явиться кнопка, що відкриває адресу в браузері.")
+        rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        rows.add_css_class("boxed-list")
+        title = Adw.EntryRow(title="Напис на кнопці")
+        url = Adw.EntryRow(title="Адреса, наприклад example.com")
+        rows.append(title)
+        rows.append(url)
+        dialog.set_extra_child(rows)
+        dialog.add_response("cancel", "Скасувати")
+        dialog.add_response("insert", "Вставити")
+        dialog.set_response_appearance("insert", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_response_enabled("insert", False)
+        dialog.set_default_response("insert")
+        dialog.set_close_response("cancel")
+        url.connect("changed", lambda e: dialog.set_response_enabled("insert", bool(e.get_text().strip())))
+        dialog.connect("response", lambda _d, r: r == "insert" and self.insert_link(title.get_text(), url.get_text()))
+        dialog.present(self.win)
+        return dialog, title, url
+
+    def insert_link(self, title, url):
+        """Inserts [title](url) on its own line at the cursor."""
+        url = normalize_url(url)
+        title = (title.strip() or url).replace("[", "(").replace("]", ")")
+        buffer = self.win.buffer
+        cursor = buffer.get_iter_at_mark(buffer.get_insert())
+        text = f"[{title}]({url})"
+        if not cursor.starts_line():
+            text = "\n" + text
+        if not cursor.ends_line():
+            text += "\n"
+        buffer.insert_at_cursor(text)
         self.win.view.grab_focus()
 
     def on_reload(self):
@@ -812,10 +1163,36 @@ class Prompter(Adw.Application):
             return
         self.load_file(file.get_path())
 
+    @property
+    def is_untitled(self):
+        """The script lives only in Prompter's own config folder (the sample
+        script from the first start), not in a file the user chose."""
+        return not self.path or Path(self.path) == DEFAULT_SCRIPT.resolve()
+
+    def on_save(self):
+        if self.is_untitled:
+            self.on_save_as()
+            return
+        self.flush_save()
+        try:
+            saved = Path(self.path).read_text(encoding="utf-8") == self.text
+        except (OSError, UnicodeDecodeError):
+            saved = False
+        if saved:
+            self.win.toast(f"Збережено: {Path(self.path).name}")
+
     def on_save_as(self):
-        dialog = Gtk.FileDialog(title="Зберегти сценарій як", filters=self.text_filters(),
-                                initial_name=Path(self.path).name if self.path else "сценарій.md")
-        dialog.save(self.win, None, self.on_save_as_done)
+        self.win.present()
+        self.save_dialog().save(self.win, None, self.on_save_as_done)
+
+    def save_dialog(self):
+        dialog = Gtk.FileDialog(title="Куди зберегти сценарій?", modal=True, filters=self.text_filters(),
+                                initial_name="сценарій.md" if self.is_untitled else Path(self.path).name)
+        if self.is_untitled:
+            documents = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+            if documents:
+                dialog.set_initial_folder(Gio.File.new_for_path(documents))
+        return dialog
 
     def on_save_as_done(self, dialog, result):
         try:
@@ -828,6 +1205,7 @@ class Prompter(Adw.Application):
             self.win.toast(f"Не вдалося зберегти: {e}")
             return
         self.load_file(path)
+        self.win.toast(f"Збережено: {Path(path).name}")
 
     @staticmethod
     def text_filters():

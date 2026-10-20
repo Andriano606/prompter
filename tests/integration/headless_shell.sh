@@ -17,8 +17,16 @@ if [[ -z "${_PR_INNER:-}" ]]; then
     ln -s "$REPO/extension" "$TMP/gnome-shell/extensions/$UUID"
     ln -s "$REPO/tests/integration/$TEST_UUID" "$TMP/gnome-shell/extensions/$TEST_UUID"
     : >"$TMP/config/glib-2.0/settings/keyfile"
+    # A fake browser: http(s) links opened by the app are appended to a file.
+    mkdir -p "$TMP/applications"
+    printf '#!/bin/sh\necho "$1" >> "%s/opened-urls.txt"\n' "$TMP" >"$TMP/test-browser.sh"
+    chmod +x "$TMP/test-browser.sh"
+    printf '[Desktop Entry]\nType=Application\nName=Test browser\nExec=%s %%u\nNoDisplay=true\nMimeType=x-scheme-handler/http;x-scheme-handler/https;\n' \
+        "$TMP/test-browser.sh" >"$TMP/applications/prompter-test-browser.desktop"
+    printf '[Default Applications]\nx-scheme-handler/http=prompter-test-browser.desktop\nx-scheme-handler/https=prompter-test-browser.desktop\n' \
+        >"$TMP/config/mimeapps.list"
     export XDG_DATA_HOME="$TMP" XDG_CONFIG_HOME="$TMP/config" GSETTINGS_BACKEND=keyfile \
-        _PR_INNER=1 _PR_TMP="$TMP"
+        _PR_INNER=1 _PR_TMP="$TMP" PROMPTER_TEST_URLS="$TMP/opened-urls.txt"
     dbus-run-session -- "$0" "$@"
     exit $?
 fi

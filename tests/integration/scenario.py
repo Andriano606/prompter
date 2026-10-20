@@ -3,6 +3,7 @@ headless_shell.sh (one virtual 1920x1080 monitor). Exits non-zero on the first
 failure."""
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -166,7 +167,8 @@ def near(a, b):
 
 
 CONFIG.mkdir(parents=True, exist_ok=True)
-SCRIPT.write_text("Один\n\n---\n\nДва\n\n---\n\nТри\n", encoding="utf-8")
+LINK_PAGE = "Два\n[Демо](example.com/demo?a=1&b=2)"
+SCRIPT.write_text(f"Один\n\n---\n\n{LINK_PAGE}\n\n---\n\nТри\n", encoding="utf-8")
 app_log = open(CONFIG / "app.log", "w")
 app = subprocess.Popen([sys.executable, str(PROMPTER), str(SCRIPT)], stderr=app_log)
 try:
@@ -176,7 +178,7 @@ try:
     wait_for(lambda: focus_title() == MAIN_TITLE, what="focus handed back to the main window")
     check(True, "showing the overlay does not steal focus")
 
-    status = wait_for(lambda: (s := shortcut_status()) and len(s) == 8 and all(s.values()) and s,
+    status = wait_for(lambda: (s := shortcut_status()) and len(s) == 9 and all(s.values()) and s,
                       what="all default shortcuts grabbed")
     check(True, f"extension grabbed the shortcuts from shortcuts.json ({len(status)})")
 
@@ -186,6 +188,12 @@ try:
     press("Control_L", "Super_L", "Left")
     wait_for(lambda: position() == 1, what="prev block via ⌃⌘←")
     check(True, "global next/prev shortcuts switch blocks")
+
+    urls = Path(os.environ["PROMPTER_TEST_URLS"])
+    press("Control_L", "Super_L", "o")
+    wait_for(lambda: urls.exists() and urls.read_text().split() == ["https://example.com/demo?a=1&b=2"],
+             what="⌃⌘O opens the page's link")
+    check(True, "⌃⌘O opens the current page's link in the default browser")
 
     shortcuts = json.loads((CONFIG / "shortcuts.json").read_text(encoding="utf-8"))
     shortcuts["next"] = "<Control><Super>n"
@@ -210,7 +218,7 @@ try:
     wait_for(lambda: focus_title() == MAIN_TITLE, what="main window focused")
     cli("new-page")
     type_text("Xyz")
-    wait_for(lambda: script_pages() == ["Один", "Xyz", "Два", "Три", "Чотири"],
+    wait_for(lambda: script_pages() == ["Один", "Xyz", LINK_PAGE, "Три", "Чотири"],
              what=f"new page saved after the first one (got {script_pages()})")
     check(True, "new page is inserted after the current page and saved")
     wait_for(lambda: position() == 1, what="overlay follows the page being edited")

@@ -124,3 +124,66 @@ def test_standalone_keys_allowed_without_modifier():
     assert pr.validate_shortcut("Right", shortcuts, "next").startswith("Потрібен модифікатор")
     assert pr.is_standalone("Page_Up") and not pr.is_standalone("<Control>Page_Up")
     assert pr.pretty_shortcut("Page_Down") == "PgDn"
+
+
+def test_links_become_buttons():
+    block = "Дивіться [Демо](example.com/demo?a=1&b=2) і [Док](https://docs.io)\nтекст"
+    assert pr.links_of(block) == [("Демо", "https://example.com/demo?a=1&b=2"), ("Док", "https://docs.io")]
+    assert pr.links_of("без посилань [не](посилання") == []
+    assert pr.normalize_url(" mailto:a@b.c ") == "mailto:a@b.c"
+
+
+def test_link_markup_keeps_title_underlined_and_escapes():
+    assert pr.to_markup("**Увага** [A & B](x.com/?q=1&r=2)") == "<b>Увага</b> <u>A &amp; B</u>"
+    assert pr.first_line("[Демо](example.com) — початок") == "Демо — початок"
+    # A line with nothing but a link becomes only a button.
+    assert pr.to_markup("Текст\n  [Демо](example.com)  \nдалі") == "Текст\nдалі"
+
+
+TABLE_SCRIPT = r"""# Сценарій / Script
+> Примітка над таблицею.
+
+| Українська | English |
+|---|---|
+| **1. Вступ**<br>Привіт! | **1. Intro**<br>Hi! |
+| **2. Демо**<br>[Відкрити X → Y]<br>• пункт | **2. Demo**<br>[Open X → Y] |
+| з \| трубою | with \| pipe |
+
+---
+
+Після таблиці
+"""
+
+
+def test_table_rows_become_pages_in_one_column():
+    assert pr.table_columns(TABLE_SCRIPT) == ["Українська", "English"]
+    uk = pr.split_blocks(TABLE_SCRIPT, 0)
+    assert uk == ["# Сценарій / Script\n> Примітка над таблицею.", "**1. Вступ**\nПривіт!",
+                  "**2. Демо**\n[Відкрити X → Y]\n• пункт", "з | трубою", "Після таблиці"]
+    en = pr.split_blocks(TABLE_SCRIPT, 1)
+    assert en[1:4] == ["**1. Intro**\nHi!", "**2. Demo**\n[Open X → Y]", "with | pipe"]
+    assert pr.table_columns("без таблиць | тут") == []
+
+
+def test_table_row_spans_and_new_page_after_the_table():
+    pages = pr.parse_pages(TABLE_SCRIPT)
+    row = pages[1]
+    assert TABLE_SCRIPT[row.start:row.end].startswith("| **1. Вступ**") and "\n" not in TABLE_SCRIPT[row.start:row.end]
+    assert pr.block_at(TABLE_SCRIPT, row.start + 3) == 1
+    # A new page from inside the table goes after the table, keeping it intact.
+    offset = pr.page_break_offset(TABLE_SCRIPT, row.start + 3)
+    assert TABLE_SCRIPT[:offset].endswith("| з \\| трубою | with \\| pipe |")
+    new = TABLE_SCRIPT[:offset] + pr.PAGE_BREAK + "Нова" + TABLE_SCRIPT[offset:]
+    assert pr.split_blocks(new)[4:] == ["Нова", "Після таблиці"]
+
+
+def test_markdown_rendering_extras():
+    markup = pr.to_markup("**2. Демо**<br>[Відкрити X → Y]\n- пункт *курсив* `код`\n> цитата")
+    assert markup.split("\n") == [
+        "<b>2. Демо</b>",
+        '<span alpha="60%"><i><small>[Відкрити X → Y]</small></i></span>',
+        "• пункт <i>курсив</i> <tt>код</tt>",
+        '<span alpha="70%"><small><small>цитата</small></small></span>',
+    ]
+    assert pr.to_markup("2 * 3 * 4") == "2 * 3 * 4"
+    assert pr.first_line("> нотатка\n- пункт") == "• пункт"

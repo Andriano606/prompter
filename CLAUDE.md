@@ -30,6 +30,15 @@ user-facing behaviour and the architecture table.
   coords (no shadow). Don't use `translate_coordinates`: PyGObject returns 2 values, not 3.
 - Pages = non-empty blocks between `---` lines (`block_spans`); the editor's cursor drives
   the overlay page (`block_at`), hotkeys scroll the editor (`programmatic_cursor` guards it).
+- Links `[title](url)` (`LINK`, `links_of`) become overlay buttons opened with
+  `Gio.AppInfo.launch_default_for_uri` (no portal). When locked, the input region is the
+  union of the link buttons' bounds (`set_input_region(surface, rects)`), recomputed two
+  frames after the buttons change, then `RefreshInput`. The headless harness installs a
+  fake https handler that appends to `$PROMPTER_TEST_URLS`.
+- Virtual input in tests: the first events of a just-created virtual device are dropped,
+  and pointer enter + button press in one batch make GTK miss the press. Create the device
+  early and move before clicking (see `gui_smoke.py`), as a real mouse does.
+- Editor views: "raw" (TextView) and "formatted" (read-only page cards, `build_page_cards`).
 - Every name in `REMOTE_ACTIONS` is also a CLI word. Anything missing there is treated as
   a *file name* by `prompter ДІЯ` (that once opened a script called "preferences").
 
