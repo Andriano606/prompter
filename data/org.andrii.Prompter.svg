@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4a5a82"/>
+      <stop offset="1" stop-color="#262f47"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#10141f"/>
+      <stop offset="1" stop-color="#1b2232"/>
+    </linearGradient>
+    <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#10141f" stop-opacity="1"/>
+      <stop offset="0.28" stop-color="#10141f" stop-opacity="0"/>
+      <stop offset="0.72" stop-color="#1b2232" stop-opacity="0"/>
+      <stop offset="1" stop-color="#1b2232" stop-opacity="1"/>
+    </linearGradient>
+  </defs>
+  <!-- base with a darker bottom edge, GNOME style -->
+  <rect x="10" y="16" width="108" height="100" rx="20" fill="#1a2033"/>
+  <rect x="10" y="12" width="108" height="100" rx="20" fill="url(#body)"/>
+  <!-- screen -->
+  <rect x="20" y="22" width="88" height="80" rx="11" fill="url(#screen)"/>
+  <!-- script lines -->
+  <g fill="#e8ecf5">
+    <rect x="34" y="32" width="50" height="6" rx="3" opacity="0.45"/>
+    <rect x="34" y="45" width="62" height="6" rx="3" opacity="0.7"/>
+    <rect x="34" y="73" width="58" height="6" rx="3" opacity="0.7"/>
+    <rect x="34" y="86" width="40" height="6" rx="3" opacity="0.45"/>
+  </g>
+  <!-- current line -->
+  <rect x="24" y="56" width="80" height="14" rx="7" fill="#ffffff" opacity="0.08"/>
+  <rect x="34" y="59" width="64" height="8" rx="4" fill="#ffc83d"/>
+  <path d="M26 57.5 L32 63 L26 68.5 Z" fill="#ffc83d"/>
+  <!-- fade at the top and bottom of the screen -->
+  <rect x="20" y="22" width="88" height="80" rx="11" fill="url(#fade)"/>
+</svg>

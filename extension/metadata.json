@@ -1,0 +1,7 @@
+{
+  "uuid": "prompter@andrii.local",
+  "name": "Prompter (backend)",
+  "description": "Keeps the Prompter overlay above all windows and handles its global keyboard shortcuts.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "version": 1
+}

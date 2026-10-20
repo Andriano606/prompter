@@ -1,0 +1,6 @@
+{
+  "uuid": "unsafe-mode@prompter.test",
+  "name": "Unsafe mode (tests only)",
+  "description": "Enables org.gnome.Shell.Eval inside the throwaway headless test shell. Never install it on a real desktop.",
+  "shell-version": ["46", "47", "48", "49", "50"]
+}
